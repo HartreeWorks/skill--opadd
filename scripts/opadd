@@ -1,0 +1,272 @@
+#!/bin/bash
+# Save an API key from the macOS clipboard or a prompt-time snapshot to
+# 1Password without putting the secret in model context, argv, or shell history.
+set -euo pipefail
+
+SNAPSHOT_DIR="$HOME/.cache/opadd"
+# Keep in step with the prompt hook: both honour OPADD_SNAPSHOT_MAX_AGE_MS.
+case "${OPADD_SNAPSHOT_MAX_AGE_MS:-}" in
+  ''|*[!0-9]*|0) SNAPSHOT_MAX_AGE=300 ;;
+  *) SNAPSHOT_MAX_AGE=$(( (OPADD_SNAPSHOT_MAX_AGE_MS + 999) / 1000 )) ;;
+esac
+VAULT="${OPADD_VAULT:-}"
+VAULT_FLAG=""
+SHARED=0
+OP_CMD=(op)
+PROFILE=""
+PROFILES_FILE="${OPADD_PROFILES:-$HOME/.config/opadd/profiles}"
+HOST_VAL=""
+NOTES=""
+SNAPSHOT_ID=""
+ENV_FILE=""
+ENV_VAR=""
+ENV_TEMP=""
+OP_ERR=""
+TITLE=""
+
+usage() {
+  echo "usage: opadd <title> [--vault NAME | --shared] [--hostname HOST] [--notes TEXT] [--snapshot-id ID] [--env-file PATH --env-var NAME]"
+}
+
+missing_value() {
+  echo "opadd: $1 requires a value" >&2
+  usage >&2
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vault)
+      [ $# -ge 2 ] || missing_value "$1"
+      VAULT_FLAG="$2"; shift 2 ;;
+    --shared) SHARED=1; shift ;;
+    --hostname)
+      [ $# -ge 2 ] || missing_value "$1"
+      HOST_VAL="$2"; shift 2 ;;
+    --notes)
+      [ $# -ge 2 ] || missing_value "$1"
+      NOTES="$2"; shift 2 ;;
+    --snapshot-id)
+      [ $# -ge 2 ] || missing_value "$1"
+      SNAPSHOT_ID="$2"; shift 2 ;;
+    --env-file)
+      [ $# -ge 2 ] || missing_value "$1"
+      ENV_FILE="$2"; shift 2 ;;
+    --env-var)
+      [ $# -ge 2 ] || missing_value "$1"
+      ENV_VAR="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "opadd: unknown option $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [ -z "$TITLE" ]; then TITLE="$1"; shift
+      else echo "opadd: unexpected argument: $1" >&2; usage >&2; exit 1; fi ;;
+  esac
+done
+
+[ -n "$TITLE" ] || { usage >&2; exit 1; }
+
+# Profiles: the first line of the profiles file whose folder pattern matches the working directory picks the
+# 1Password command and vaults, so that keys for one organisation go to its own 1Password. A line is
+#   <folder pattern> <command> <default vault> [<shared vault>]
+# separated by whitespace; the pattern may start with ~ and use shell globs, and matches the folder and
+# everything under it; # starts a comment. --shared picks the shared vault; --vault overrides both.
+if [ -r "$PROFILES_FILE" ]; then
+  while read -r pattern cmd pvault pshared _; do
+    case "$pattern" in ''|'#'*) continue ;; esac
+    pattern="${pattern/#\~/$HOME}"
+    # shellcheck disable=SC2254
+    case "$PWD" in $pattern|$pattern/*)
+      PROFILE="$pattern"; read -r -a OP_CMD <<< "$cmd"; VAULT="$pvault"
+      if [ "$SHARED" -eq 1 ]; then
+        [ -n "$pshared" ] || { echo "opadd: the profile for $pattern has no shared vault" >&2; exit 1; }
+        VAULT="$pshared"
+      fi
+      break ;;
+    esac
+  done < "$PROFILES_FILE"
+fi
+if [ "$SHARED" -eq 1 ] && [ -z "$PROFILE" ]; then
+  echo "opadd: --shared needs a profile matching $PWD in $PROFILES_FILE" >&2
+  exit 1
+fi
+[ -z "$VAULT_FLAG" ] || VAULT="$VAULT_FLAG"
+[ -n "$VAULT" ] || {
+  echo "opadd: set OPADD_VAULT or pass --vault NAME" >&2
+  exit 1
+}
+
+if { [ -n "$ENV_FILE" ] && [ -z "$ENV_VAR" ]; } || { [ -z "$ENV_FILE" ] && [ -n "$ENV_VAR" ]; }; then
+  echo "opadd: --env-file and --env-var must be passed together" >&2
+  exit 1
+fi
+
+if [ -n "$ENV_FILE" ]; then
+  case "$ENV_VAR" in
+    [A-Za-z_]* ) ;;
+    * ) echo "opadd: invalid environment variable name: $ENV_VAR" >&2; exit 1 ;;
+  esac
+  case "$ENV_VAR" in
+    *[!A-Za-z0-9_]* ) echo "opadd: invalid environment variable name: $ENV_VAR" >&2; exit 1 ;;
+  esac
+
+  env_dir=$(dirname "$ENV_FILE")
+  env_name=$(basename "$ENV_FILE")
+  [ -d "$env_dir" ] || { echo "opadd: env-file directory does not exist: $env_dir" >&2; exit 1; }
+  [ ! -L "$ENV_FILE" ] || { echo "opadd: refusing to write through an env-file symlink" >&2; exit 1; }
+  [ ! -e "$ENV_FILE" ] || [ -f "$ENV_FILE" ] || {
+    echo "opadd: env-file is not a regular file: $ENV_FILE" >&2
+    exit 1
+  }
+  env_dir=$(cd "$env_dir" && pwd -P)
+  ENV_FILE="$env_dir/$env_name"
+
+  if /usr/bin/git -C "$env_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if /usr/bin/git -C "$env_dir" ls-files --error-unmatch -- "$env_name" >/dev/null 2>&1; then
+      echo "opadd: refusing to write a secret to tracked file: $ENV_FILE" >&2
+      exit 1
+    fi
+    if ! /usr/bin/git -C "$env_dir" check-ignore -q --no-index -- "$env_name"; then
+      echo "opadd: refusing to write a secret to a Git-visible file: $ENV_FILE" >&2
+      exit 1
+    fi
+  fi
+fi
+
+SOURCE="live clipboard"
+SECRET=""
+CLAIMED_SNAPSHOT=""
+cleanup() {
+  if [ -n "$CLAIMED_SNAPSHOT" ]; then
+    /bin/unlink "$CLAIMED_SNAPSHOT" 2>/dev/null || true
+    CLAIMED_SNAPSHOT=""
+  fi
+  if [ -n "$ENV_TEMP" ]; then
+    /bin/unlink "$ENV_TEMP" 2>/dev/null || true
+    ENV_TEMP=""
+  fi
+  if [ -n "$OP_ERR" ]; then
+    /bin/unlink "$OP_ERR" 2>/dev/null || true
+    OP_ERR=""
+  fi
+}
+trap cleanup EXIT
+
+if [ -n "$SNAPSHOT_ID" ]; then
+  case "$SNAPSHOT_ID" in
+    *[!0-9a-f]*|'') echo "opadd: invalid snapshot ID" >&2; exit 1 ;;
+  esac
+  [ "${#SNAPSHOT_ID}" -eq 32 ] || { echo "opadd: invalid snapshot ID" >&2; exit 1; }
+
+  pending_snapshot="$SNAPSHOT_DIR/snapshot-$SNAPSHOT_ID"
+  CLAIMED_SNAPSHOT="$SNAPSHOT_DIR/claimed-$SNAPSHOT_ID-$$"
+  if ! /bin/mv "$pending_snapshot" "$CLAIMED_SNAPSHOT" 2>/dev/null; then
+    CLAIMED_SNAPSHOT=""
+    echo "opadd: prompt-time snapshot is missing or expired; copy the key again" >&2
+    exit 4
+  fi
+
+  modified=$(stat -f %m "$CLAIMED_SNAPSHOT") || {
+    echo "opadd: could not inspect the prompt-time snapshot" >&2
+    exit 4
+  }
+  age=$(( $(date +%s) - modified ))
+  if [ "$age" -lt 0 ] || [ "$age" -gt "$SNAPSHOT_MAX_AGE" ]; then
+    echo "opadd: prompt-time snapshot expired; copy the key again" >&2
+    exit 4
+  fi
+
+  SECRET=$(/bin/cat "$CLAIMED_SNAPSHOT")
+  cleanup
+  SOURCE="prompt-time snapshot (${age}s old)"
+else
+  SECRET=$(/usr/bin/pbpaste 2>/dev/null || true)
+fi
+SECRET="${SECRET%$'\n'}"
+
+# Validation failures never echo the value.
+fail() { echo "opadd: $1 (source: $SOURCE). Copy the key again and re-run." >&2; exit 2; }
+[ -n "$SECRET" ] || fail "no value found—clipboard empty"
+case "$SECRET" in *$'\n'*) fail "value spans multiple lines—does not look like an API key" ;; esac
+case "$SECRET" in *' '*|*$'\t'*) fail "value contains whitespace—does not look like an API key" ;; esac
+len=${#SECRET}
+[ "$len" -ge 16 ] || fail "value is only ${len} chars—too short for an API key"
+[ "$len" -le 4096 ] || fail "value is ${len} chars—too long for an API key"
+if printf '%s' "$SECRET" | LC_ALL=C grep -q '[^!-~]'; then
+  fail "value contains non-printable or non-ASCII characters"
+fi
+
+if [ -n "$ENV_FILE" ]; then
+  ENV_TEMP=$(mktemp "$env_dir/.opadd.XXXXXX") || {
+    echo "opadd: could not create a temporary env file" >&2
+    exit 1
+  }
+  chmod 600 "$ENV_TEMP"
+  quoted_secret=${SECRET//\'/\'"\'"\'}
+  assignment="$ENV_VAR='$quoted_secret'"
+  found=0
+  dropped=0
+  if [ -f "$ENV_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "$ENV_VAR="*)
+          if [ "$found" -eq 0 ]; then printf '%s\n' "$assignment"; found=1; else dropped=$((dropped + 1)); fi ;;
+        "export $ENV_VAR="*)
+          if [ "$found" -eq 0 ]; then printf 'export %s\n' "$assignment"; found=1; else dropped=$((dropped + 1)); fi ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$ENV_FILE" > "$ENV_TEMP"
+  fi
+  if [ "$found" -eq 0 ]; then printf '%s\n' "$assignment" >> "$ENV_TEMP"; fi
+fi
+
+if [ -z "$PROFILE" ] && [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] && [ -r "$HOME/.config/1password/agent-token" ]; then
+  OP_SERVICE_ACCOUNT_TOKEN=$(/bin/cat "$HOME/.config/1password/agent-token")
+  export OP_SERVICE_ACCOUNT_TOKEN
+fi
+
+# Build item JSON on stdin and suppress op's item output so the credential
+# cannot be copied into model context by the calling agent. op's stderr is
+# relayed on failure only after checking it does not contain the credential.
+OP_ERR=$(mktemp "$SNAPSHOT_DIR/.op-err.XXXXXX" 2>/dev/null || mktemp) || OP_ERR=""
+if ! { printf '%s' "$SECRET" | jq -Rs \
+      --arg title "$TITLE" --arg host "$HOST_VAL" --arg notes "$NOTES" \
+      '{title: $title, category: "API_CREDENTIAL",
+        fields: ([{id: "credential", type: "CONCEALED", value: .}]
+          + (if $host != "" then [{id: "hostname", type: "STRING", value: $host}] else [] end)
+          + (if $notes != "" then [{id: "notesPlain", type: "STRING", purpose: "NOTES", value: $notes}] else [] end))}' \
+      | "${OP_CMD[@]}" item create --vault "$VAULT" --format json; } >/dev/null 2>"${OP_ERR:-/dev/null}"; then
+  echo "opadd: op item create failed (vault '$VAULT')." >&2
+  if [ -n "$OP_ERR" ] && [ -s "$OP_ERR" ]; then
+    op_err_text=$(/usr/bin/head -c 4096 "$OP_ERR")
+    escaped_secret=$(printf '%s' "$SECRET" | jq -R .)
+    escaped_secret=${escaped_secret#\"}; escaped_secret=${escaped_secret%\"}
+    case "$op_err_text" in
+      *"$SECRET"*|*"$escaped_secret"*)
+        echo "opadd: op diagnostics withheld because they contain the credential; run op item create directly" >&2 ;;
+      *)
+        printf '%s\n' "$op_err_text" | /usr/bin/head -n 20 | /usr/bin/sed 's/^/  op: /' >&2 ;;
+    esac
+  fi
+  exit 3
+fi
+
+if [ -n "$ENV_FILE" ]; then
+  if ! mv_err=$(/bin/mv "$ENV_TEMP" "$ENV_FILE" 2>&1); then
+    echo "opadd: WARNING: '$TITLE' was saved to 1Password vault '$VAULT', but the env file was NOT updated." >&2
+    echo "opadd: $ENV_FILE is unchanged (${mv_err:-mv failed}). Do not re-run opadd, which would create a duplicate item; set $ENV_VAR from 1Password instead." >&2
+    exit 5
+  fi
+  ENV_TEMP=""
+  chmod 600 "$ENV_FILE" || echo "opadd: WARNING: could not set permissions 600 on $ENV_FILE" >&2
+  echo "Set $ENV_VAR in '$ENV_FILE'."
+  if [ "$dropped" -gt 0 ]; then
+    echo "opadd: WARNING: removed $dropped duplicate $ENV_VAR= line(s) from $ENV_FILE; only the first was replaced." >&2
+  fi
+fi
+
+echo "Saved '$TITLE' to 1Password vault '$VAULT'${PROFILE:+ with ${OP_CMD[*]}} (${len}-char credential, source: $SOURCE)."
+
+if [ "$(/usr/bin/pbpaste 2>/dev/null || true)" = "$SECRET" ]; then
+  printf '' | /usr/bin/pbcopy
+  echo "Clipboard cleared."
+fi
